@@ -16,15 +16,15 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy only project metadata first for better layer caching
-COPY pyproject.toml /app/
+# Copy project metadata first (include lock if present) for better caching
+COPY pyproject.toml uv.lock* /app/
 
 # Sync deps into a virtualenv in /app/.venv
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-install-project --no-editable || \
     uv sync --no-install-project --no-editable
 
-# Now copy the rest of the source
+# Copy the rest of the source (includes main.py and job_main.py)
 COPY . /app
 
 # Install project into venv (editable off in container)
@@ -34,9 +34,14 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 ENV VIRTUAL_ENV=/app/.venv
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
+# Optional: drop privileges
+# RUN useradd -u 10001 -m app && chown -R app:app /app
+# USER app
+
 # Cloud Run expects to listen on PORT
 ENV PORT=8080
 EXPOSE 8080
 
-# Use runtime PORT if provided (Cloud Run)
+# Default to API server; Cloud Run Jobs override to:
+#   --command uv --args "run,python,job_main.py"
 CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}"]

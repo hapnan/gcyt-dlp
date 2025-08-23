@@ -4,14 +4,14 @@ import asyncio
 import tempfile
 import shutil
 from pathlib import Path
-from typing import Optional, TYPE_CHECKING
+from typing import Optional, TYPE_CHECKING, Dict
 import json
-import base64  # added
+import urllib.request
 
-from fastapi import FastAPI, HTTPException,  Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.concurrency import run_in_threadpool
-from starlette.background import BackgroundTask  # added
+from starlette.background import BackgroundTask
 
 try:
     from google.cloud import storage  # type: ignore
@@ -41,7 +41,6 @@ def _download_with_ytdlp(url: str, tmpdir: Path) -> Path:
     out_tmpl = str(tmpdir / "%(title)s.%(ext)s")
     ydl_opts = {
         "outtmpl": out_tmpl,
-        # Best progressive (contains audio) or best audio+video merged
         "format": "bestvideo+bestaudio/best",
         "merge_output_format": "mp4",
         "noplaylist": True,
@@ -50,19 +49,15 @@ def _download_with_ytdlp(url: str, tmpdir: Path) -> Path:
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
-        # When merging, the final path is in _filename or returned value
         if info and "requested_downloads" in info and info["requested_downloads"]:
-            # Last requested file likely the merged file
             filename = info["requested_downloads"][-1]["_filename"]
         else:
             filename = ydl.prepare_filename(info)
     path = Path(filename)
     if not path.exists():
-        # Fallback: find any file in tmpdir
         candidates = list(tmpdir.glob("*"))
         if not candidates:
             raise FileNotFoundError("Downloaded file not found")
-        # choose largest
         path = max(candidates, key=lambda p: p.stat().st_size)
     return path
 
@@ -77,8 +72,46 @@ def _upload_to_gcs(file_path: Path, bucket_name: str, object_name: Optional[str]
         object_name = file_path.name
     blob = bucket.blob(object_name)
     blob.upload_from_filename(str(file_path))
-    blob.make_public()  # optional: ease access; consider signed URLs in prod
+    blob.make_public()  # consider signed URLs in production
     return blob.public_url
+
+def _get_gcp_access_token() -> str:
+    """Fetch an access token from the metadata server (works on Cloud Run)."""
+    req = urllib.request.Request(
+        "http://metadata/computeMetadata/v1/instance/service-accounts/default/token",
+        headers={"Metadata-Flavor": "Google"},
+    )
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+        return data["access_token"]
+
+def _run_cloud_run_job(project: str, region: str, job: str, env_overrides: Dict[str, Optional[str]]) -> dict:
+    """
+    Call Cloud Run Jobs v2 run API with env overrides.
+    Requires the service account to have run.jobs.run (e.g., roles/run.admin or roles/run.developer).
+    """
+    url = f"https://run.googleapis.com/v2/projects/{project}/locations/{region}/jobs/{job}:run"
+    token = _get_gcp_access_token()
+    body = {
+        "overrides": {
+            "containerOverrides": [
+                {
+                    "env": [
+                        {"name": k, "value": v}
+                        for k, v in env_overrides.items()
+                        if v is not None
+                    ]
+                }
+            ]
+        }
+    }
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST", headers={
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    })
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read().decode("utf-8"))
 
 @app.get("/healthz")
 def healthz():
@@ -86,20 +119,16 @@ def healthz():
 
 @app.post("/download")
 async def download(request: Request, url: str, to_gcs: bool = False, bucket: str | None = None, object_name: str | None = None):
-    _require_secret(request)  # added
+    _require_secret(request)
     try:
-        # Optional: fail fast if queue is full
         await asyncio.wait_for(_semaphore.acquire(), timeout=REQ_QUEUE_TIMEOUT)
     except asyncio.TimeoutError:
-        # Too many in-flight downloads on this instance
         raise HTTPException(status_code=503, detail="Busy, try again later")
 
     tmpdir: Optional[str] = None
     try:
         tmpdir = tempfile.mkdtemp(prefix="yt_")
         tmpdir_path = Path(tmpdir)
-
-        # Run blocking yt-dlp off the event loop
         video_path = await run_in_threadpool(_download_with_ytdlp, url, tmpdir_path)
 
         if to_gcs:
@@ -114,12 +143,11 @@ async def download(request: Request, url: str, to_gcs: bool = False, bucket: str
                 "size": video_path.stat().st_size,
             })
 
-        # Stream file and delete temp dir after response is sent
         return FileResponse(
             path=str(video_path),
             filename=video_path.name,
             media_type="application/octet-stream",
-            background=BackgroundTask(shutil.rmtree, tmpdir, ignore_errors=True),  # cleanup after send
+            background=BackgroundTask(shutil.rmtree, tmpdir, ignore_errors=True),
         )
     except yt_dlp.utils.DownloadError as e:
         raise HTTPException(status_code=400, detail=f"yt-dlp error: {e}")
@@ -127,114 +155,44 @@ async def download(request: Request, url: str, to_gcs: bool = False, bucket: str
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         _semaphore.release()
-        # If we uploaded to GCS or errored before streaming, ensure cleanup now
         if tmpdir is not None and to_gcs:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
-# --- Background worker endpoints ---
-
-@app.post("/tasks/handle")
-async def handle_cloud_tasks(request: Request):
+@app.post("/jobs/trigger")
+async def trigger_job(request: Request):
     """
-    Cloud Tasks HTTP target.
-    Body JSON: { "url": "...", "bucket": "...", "object_name": "optional" }
-    Secured via X-Worker-Token if WORKER_TOKEN/SECRET_TOKEN is set.
-    Always uploads to GCS (recommended for background).
+    Trigger a Cloud Run Job execution with URL (and optional BUCKET/object name overrides).
+    Body JSON:
+      {
+        "url": "https://youtu.be/...",
+        "bucket": "YOUR_BUCKET",              // optional if set on the Job
+        "object_name": "optional.mp4",
+        "project": "PROJECT_ID",              // optional if PROJECT_ID env is set
+        "region": "REGION",                   // optional if JOB_REGION/REGION env is set
+        "job": "JOB_NAME"                     // optional if JOB_NAME env is set
+      }
+    Uses X-Worker-Token if configured.
     """
     _require_secret(request)
     body = await request.json()
-    url = body.get("url")
-    bucket = body.get("bucket")
+    url_val = body.get("url")
+    if not url_val:
+        raise HTTPException(status_code=400, detail="url is required")
+
+    project = body.get("project") or os.getenv("PROJECT_ID")
+    region = body.get("region") or os.getenv("JOB_REGION") or os.getenv("REGION")
+    job = body.get("job") or os.getenv("JOB_NAME")
+    bucket = body.get("bucket") or os.getenv("BUCKET")
     object_name = body.get("object_name")
-    if not url:
-        raise HTTPException(status_code=400, detail="url is required")
-    if not bucket:
-        raise HTTPException(status_code=400, detail="bucket is required for background jobs")
+
+    if not project or not region or not job:
+        raise HTTPException(status_code=400, detail="project, region, and job are required (via body or env)")
+    env_overrides = {"URL": url_val, "BUCKET": bucket, "OBJECT_NAME": object_name}
 
     try:
-        await asyncio.wait_for(_semaphore.acquire(), timeout=REQ_QUEUE_TIMEOUT)
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=503, detail="Busy, try again later")
-
-    tmpdir: Optional[str] = None
-    try:
-        tmpdir = tempfile.mkdtemp(prefix="yt_")
-        tmpdir_path = Path(tmpdir)
-        video_path = await run_in_threadpool(_download_with_ytdlp, url, tmpdir_path)
-        public_url = _upload_to_gcs(video_path, bucket, object_name)
-        return JSONResponse({
-            "status": "uploaded",
-            "bucket": bucket,
-            "object_name": object_name or video_path.name,
-            "url": public_url,
-            "size": video_path.stat().st_size,
-        })
-    except yt_dlp.utils.DownloadError as e:
-        raise HTTPException(status_code=400, detail=f"yt-dlp error: {e}")
+        op = await run_in_threadpool(_run_cloud_run_job, project, region, job, env_overrides)
+        return JSONResponse({"status": "dispatched", "operation": op.get("name", ""), "job": job, "region": region, "project": project})
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        _semaphore.release()
-        if tmpdir is not None:
-            shutil.rmtree(tmpdir, ignore_errors=True)
-
-@app.post("/pubsub/push")
-async def handle_pubsub_push(request: Request):
-    """
-    Pub/Sub push subscription target.
-    Expects the standard push payload:
-    {
-      "message": { "data": base64(json({url,bucket,object_name})), "attributes": {...} },
-      "subscription": "..."
-    }
-    Secured via X-Worker-Token if WORKER_TOKEN/SECRET_TOKEN is set.
-    Always uploads to GCS.
-    """
-    _require_secret(request)
-    body = await request.json()
-    message = body.get("message") or {}
-    data_b64 = message.get("data")
-    if not data_b64:
-        raise HTTPException(status_code=400, detail="missing message.data")
-    try:
-        payload = json.loads(base64.b64decode(data_b64).decode("utf-8"))
-    except Exception:
-        raise HTTPException(status_code=400, detail="invalid message.data payload")
-
-    url = payload.get("url")
-    bucket = payload.get("bucket")
-    object_name = payload.get("object_name")
-    if not url:
-        raise HTTPException(status_code=400, detail="url is required")
-    if not bucket:
-        raise HTTPException(status_code=400, detail="bucket is required for background jobs")
-
-    try:
-        await asyncio.wait_for(_semaphore.acquire(), timeout=REQ_QUEUE_TIMEOUT)
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=503, detail="Busy, try again later")
-
-    tmpdir: Optional[str] = None
-    try:
-        tmpdir = tempfile.mkdtemp(prefix="yt_")
-        tmpdir_path = Path(tmpdir)
-        video_path = await run_in_threadpool(_download_with_ytdlp, url, tmpdir_path)
-        public_url = _upload_to_gcs(video_path, bucket, object_name)
-        # Pub/Sub only needs 2xx; return details for logs/visibility.
-        return JSONResponse({
-            "status": "uploaded",
-            "bucket": bucket,
-            "object_name": object_name or video_path.name,
-            "url": public_url,
-            "size": video_path.stat().st_size,
-        })
-    except yt_dlp.utils.DownloadError as e:
-        raise HTTPException(status_code=400, detail=f"yt-dlp error: {e}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        _semaphore.release()
-        if tmpdir is not None:
-            shutil.rmtree(tmpdir, ignore_errors=True)
 
 # Entrypoint for local run: uvicorn main:app --reload
