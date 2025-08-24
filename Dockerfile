@@ -31,8 +31,14 @@ COPY . /app
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --no-editable
 
+# Make entrypoint executable
+RUN chmod +x /app/entrypoint.sh
+
+# Default runtime env
+ARG DEFAULT_MODE=api
 ENV VIRTUAL_ENV=/app/.venv
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+ENV MODE=${DEFAULT_MODE}
 
 # Optional: drop privileges
 # RUN useradd -u 10001 -m app && chown -R app:app /app
@@ -42,6 +48,5 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 ENV PORT=8080
 EXPOSE 8080
 
-# Default to API server; Cloud Run Jobs override to:
-#   --command uv --args "run,python,job_main.py"
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}"]
+# Default to entrypoint; MODE controls behavior (api|job)
+CMD ["./entrypoint.sh"]
