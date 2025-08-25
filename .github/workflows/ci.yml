@@ -65,7 +65,7 @@ jobs:
             type=ref,event=tag
             type=ref,event=pr
 
-      - name: Build and push Docker image (API default)
+      - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -75,18 +75,3 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          build-args: |
-            DEFAULT_MODE=api
-
-      - name: Build and push Docker image (JOB default)
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: ${{ github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/') }}
-          platforms: linux/amd64
-          tags: ghcr.io/${{ github.repository }}:job
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          build-args: |
-            DEFAULT_MODE=job
