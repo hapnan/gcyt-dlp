@@ -49,4 +49,4 @@ ENV PORT=8080
 EXPOSE 8080
 
 # Default to entrypoint; MODE controls behavior (api|job)
-CMD ["./entrypoint.sh"]
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}"]
