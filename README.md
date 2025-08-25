@@ -74,7 +74,6 @@ gcloud run jobs create gcyt-dlp-job `
   --add-volume name=gcs,cloud-storage-bucket=YOUR_BUCKET `
   --add-volume-mount volume=gcs,mount-path=/mnt/storage `
   --set-env-vars STORAGE_DIR=/mnt/storage`
-  --set-env-vars MODE=job
 ```
 
 Notes:
